@@ -1,15 +1,17 @@
 FROM python:3.11-slim
 
-# Nginx installieren
 RUN apt-get update && apt-get install -y nginx && rm -rf /var/lib/apt/lists/*
 
-# Streamlit & App
 WORKDIR /app
-COPY requirements.txt /app/
+
+# 1) Abhängigkeiten zuerst (Cache bleibt wirksam)
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py /app/app.py
-COPY .streamlit /root/.streamlit
+# 2) Jetzt das **gesamte Repo** in /app kopieren (damit ist app.py sicher dabei)
+COPY . /app
+
+# 3) Nginx so konfigurieren wie gebraucht
 RUN rm -f /etc/nginx/sites-enabled/default
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
