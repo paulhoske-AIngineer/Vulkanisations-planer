@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Vulkanisations-Planer – Streamlit App (Shift-Scheduler: synchrone Zellenstarts je Schicht, Ad-hoc Zellen)
+Vulkanisations-Planer – Streamlit App (Schichtplanung & synchronisierte Zellen)
+
+Neu:
+- Schichtbasierte Planung (Früh/Spät/Nacht, Start Mo 06:00, 8h)
+- Zellen starten pro Schicht synchron (alle Pressen gleichzeitig)
+- Ready-first: Zellen ohne Rüstbedarf bevorzugen; sonst Zellen mit Rüstungen, dann 2er/Singles
+- Ad-hoc Fallback-Zellen je Schicht mit gelockerten Σr/Spread (optional Vorziehen aus KW+1/+2)
+- RÜSTEN-Blöcke immer grau, Gantt nach Stand sortiert
+
+Voraussetzungen:
+  pip install streamlit pandas openpyxl xlsxwriter plotly
+  python -m streamlit run app.py
 """
 
 from __future__ import annotations
-
 import itertools
 from collections import defaultdict
 from dataclasses import dataclass
@@ -19,41 +29,38 @@ import streamlit as st
 # ---------------- UI ----------------
 st.set_page_config(page_title="Vulkanisations-Planer", layout="wide")
 st.title("🧰 Vulkanisations-Planer")
-st.caption("Zellenbildung + schichtweise Planung mit synchronen Starts, Rüstungen & Ad-hoc-Zellen")
+st.caption("Schichtbasierte Planung mit synchronen Zellen, Rüstzeiten, Vorziehen & Gantt")
 
 with st.sidebar:
-    st.header("1) Daten laden")
+    st.header("1) Datei")
     up = st.file_uploader(
         "Excel-Vorlage (*.xlsx)",
         type=["xlsx"],
         help="Sheets: Pressen, Staende, Freigaben_Werkzeug_Presse, Zykluszeiten, Bedarfe_Woche, Kapazitaet_Woche. Optional: Werkzeuge (Artikel, Anzahl_Werkzeuge).",
     )
 
-    st.header("2) Regeln / Zellen")
+    st.header("2) Zellen-Regeln")
     sum_r_limit = st.slider("Σr-Limit pro Zelle", 0.80, 1.20, 1.00, 0.01)
-    max_spread = st.slider("max. Schließzeit-Spread in Zelle", 0.0, 0.30, 0.15, 0.01, help="(Smax−Smin)/Smax")
+    max_spread = st.slider("max. Schließzeit-Spread", 0.0, 0.30, 0.15, 0.01, help="(Smax−Smin)/Smax")
     cell_strategy = st.selectbox("Zell-Strategie", ["3er → 2er → Einzel", "nur 2er → Einzel", "nur Einzel"])
     respect_stand_limit = st.checkbox("MaxMachinesPerWerker je Stand respektieren", True)
     allow_multiple_cells_per_stand = st.checkbox("Mehrere Zellen je Stand zulassen", True)
     enforce_freigefahren = st.checkbox("Nur freigefahrene Werkzeuge zulassen", True)
 
     st.header("3) Werkzeuge & Rüstzeiten")
-    setup_minutes = st.number_input("Rüstzeit (Minuten) pro Werkzeugwechsel", 0, 24*60, 240, 10)
-    limit_by_tools = st.checkbox("Anzahl gleichzeitig nutzbarer Werkzeuge je Artikel begrenzen (Sheet „Werkzeuge“)", True)
+    setup_minutes = st.number_input("Rüstzeit pro Wechsel (min)", 0, 24*60, 240, 10)
+    limit_by_tools = st.checkbox("Werkzeuganzahl je Artikel begrenzen (Sheet „Werkzeuge“)", True)
 
-    st.header("4) Vorziehen (Zellen länger fahren)")
-    allow_pull_ahead = st.checkbox("Bedarf aus KW+1/+2 vorziehen", True)
-    pull_weeks = st.number_input("Wie viele KWs nach vorn ziehen (max.)", 0, 8, 2)
+    st.header("4) Vorziehen / Fallback")
+    allow_pull_ahead = st.checkbox("Vorzuzug aus KW+1/+2 erlauben", True)
+    pull_weeks = st.number_input("Max. KWs vorziehen", 0, 8, 2)
+    relax_factor_sumr = st.slider("Relax Σr (nur Fallback)", 1.00, 1.50, 1.20, 0.01)
+    relax_spread_add = st.slider("Relax Spread (nur Fallback, +…)", 0.00, 0.40, 0.10, 0.01)
 
-    st.header("5) Gantt & Schichten")
-    gantt_year = st.number_input("Jahr (ISO für KW/Schichten)", 2020, 2100, date.today().year, 1)
+    st.header("5) Schichten & Gantt")
+    gantt_year = st.number_input("Jahr (ISO)", 2020, 2100, date.today().year, 1)
     shift_start_hour = st.number_input("Schichtstart Mo (Stunde)", 0, 23, 6)
-    show_shift_grid = st.checkbox("Schichtgitter (3×8h) anzeigen", True)
-
-    st.header("6) Ad-hoc Zellen in Schicht")
-    ad_hoc_relaxed_sum_r = st.slider("Relaxed Σr-Limit (ad-hoc in Schicht)", 0.80, 1.50, 1.20, 0.01)
-    ad_hoc_relaxed_spread = st.slider("Relaxed Spread (ad-hoc in Schicht)", 0.0, 0.60, 0.30, 0.01)
-    ad_hoc_enable = st.checkbox("Ad-hoc Zellen in laufender Schicht erlauben", True)
+    show_shift_grid = st.checkbox("Schichtgitter anzeigen", True)
 
     exclude_default = {"UTK0035", "U0210160"}
 
@@ -77,17 +84,17 @@ class PlanParams:
     limit_by_tools: bool
     allow_pull_ahead: bool
     pull_weeks: int
+    relax_factor_sumr: float
+    relax_spread_add: float
     gantt_year: int
     shift_start_hour: int
     show_shift_grid: bool
-    ad_hoc_relaxed_sum_r: float
-    ad_hoc_relaxed_spread: float
-    ad_hoc_enable: bool
 
 def normalize_flags(pressen: pd.DataFrame, freigaben: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     pressen = pressen.copy(); freigaben = freigaben.copy()
     for df in (pressen, freigaben):
-        df["Pressenname"] = df["Pressenname"].astype(str).str.strip()
+        if "Pressenname" in df.columns:
+            df["Pressenname"] = df["Pressenname"].astype(str).str.strip()
     pressen["Aktiv_bool"] = pressen["Aktiv"].astype(str).str.strip().str.lower().eq("ja")
     freigaben["Freigefahren_bool"] = (
         freigaben["Freigefahren"].astype(str).str.strip().str.lower()
@@ -122,7 +129,21 @@ def spread_from_s(s_list: List[float]) -> float:
     smin, smax = min(s_list), max(s_list)
     return (smax - smin)/smax if smax else 0.0
 
-# ---- Zellen-Builder (mit CellID und Werkzeuglimit) ----
+def make_shifts(year:int, kw:int, start_hour:int) -> List[Tuple[int, datetime, datetime, int, str]]:
+    """21 Schichten ab Mo start_hour: 3×8h pro Tag, 7 Tage."""
+    base = datetime.combine(date.fromisocalendar(year, kw, 1), time(hour=start_hour))
+    names = ["Früh","Spät","Nacht"]
+    shifts=[]
+    idx=0
+    for d in range(7):
+        for s in range(3):
+            stt = base + timedelta(days=d, hours=8*s)
+            end = stt + timedelta(hours=8)
+            shifts.append((idx, stt, end, d, names[s]))
+            idx += 1
+    return shifts
+
+# ---- Zellen-Builder (pressenfix) für Vorplanung der Minuten ----
 def build_cells(
     k: int,
     articles: List[str],
@@ -147,8 +168,7 @@ def build_cells(
         if press not in presses_for_article[artikel] and len(presses_for_article[artikel]) >= tools_limit[artikel]:
             return 0.0
         take = min(minutes, capacity_left.get(press, 0.0), remain_min.get(artikel, 0.0))
-        if take <= 0:
-            return 0.0
+        if take <= 0: return 0.0
         plan_rows_local.append({
             "StandID": stand_id, "Presse": press, "Artikel": artikel,
             "Dauer_min": float(take), "CellID": cell_id, "QuelleKW": None
@@ -213,7 +233,7 @@ def build_cells(
 
 # ---- Planung (inkl. Vorziehen) ----
 def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_override_kw: Optional[pd.DataFrame] = None):
-    # --- Read ---
+    # --- Daten laden ---
     pressen = sheets["Pressen"].copy()
     staende = sheets["Staende"].copy()
     freigaben = sheets["Freigaben_Werkzeug_Presse"].copy()
@@ -221,7 +241,7 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
     bedarfe = sheets["Bedarfe_Woche"].copy()
     kap = sheets["Kapazitaet_Woche"].copy()
 
-    # optionales Werkzeuge-Sheet
+    # optional: Werkzeuge
     tools_map: Dict[str,int] = defaultdict(lambda: 9999)
     w_sheet = None
     for cand in ["Werkzeuge", "Anzahl_Werkzeuge"]:
@@ -229,50 +249,46 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
     if w_sheet is not None and params.limit_by_tools:
         w_sheet.columns=[c.strip() for c in w_sheet.columns]
         art_col="Artikel"
-        if "Anzahl_Werkzeuge" in w_sheet.columns:
-            cnt_col="Anzahl_Werkzeuge"
-        else:
-            cnt_col=[c for c in w_sheet.columns if "anzahl" in c.lower()][0]
+        cnt_col = "Anzahl_Werkzeuge" if "Anzahl_Werkzeuge" in w_sheet.columns else \
+                  [c for c in w_sheet.columns if "anzahl" in c.lower()][0]
         tools_map.update({str(r[art_col]): int(r[cnt_col]) for _, r in w_sheet[[art_col,cnt_col]].dropna().iterrows()})
 
-    # --- Normalize ---
+    # Normalisieren
     for df in (pressen, staende, freigaben, zyklen, bedarfe, kap):
         if "Artikel" in df.columns:
             df["Artikel"] = df["Artikel"].astype(str).str.strip()
         if "Pressenname" in df.columns:
             df["Pressenname"] = df["Pressenname"].astype(str).str.strip()
-
     pressen, freigaben = normalize_flags(pressen, freigaben)
     zyklen = build_time_features(zyklen)
     zyklen_u = agg_zyklen_unique(zyklen)
 
-    # --- Filter ---
+    # Filter
     if params.enforce_freigefahren:
         freigaben = freigaben[freigaben["Freigefahren_bool"]]
     if params.exclude:
         freigaben = freigaben[~freigaben["Artikel"].isin(params.exclude)]
-        # ^^^ Tippfehler fixen, falls nötig (eckige Klammer stimmt)
-        zyklen_u = zyklen_u[~zyklen_u["Artikel"].isin(params.exclude)]
-        bedarfe  = bedarfe[~bedarfe["Artikel"].isin(params.exclude)]
+        zyklen_u  = zyklen_u[~zyklen_u["Artikel"].isin(params.exclude)]
+        bedarfe   = bedarfe[~bedarfe["Artikel"].isin(params.exclude)]
 
     bedarfe["KW_num"] = pd.to_numeric(bedarfe["KW"], errors="coerce")
     if params.kw not in set(bedarfe["KW_num"].dropna().astype(int)):
         raise ValueError(f"KW {params.kw} ist in Bedarfe_Woche nicht vorhanden.")
 
-    # Bedarfe-Override (Editor)
+    # Bedarfe-Override aus Editor
     if bedarfe_override_kw is not None:
         bedarfe = bedarfe.copy()
         mask = bedarfe["KW_num"]==params.kw
         bed_map = dict(zip(bedarfe_override_kw["Artikel"], bedarfe_override_kw["Bedarf"]))
         bedarfe.loc[mask, "Bedarf"] = bedarfe.loc[mask, "Artikel"].map(bed_map).fillna(bedarfe.loc[mask, "Bedarf"])
 
-    # Kapazität
+    # Kapazitäten
     pressen_active = pressen[pressen["Aktiv_bool"]][["PressID","Pressenname","StandID"]]
     kap_active = kap.merge(pressen_active[["PressID"]], left_on="Presse_ID", right_on="PressID", how="inner")
     kap_active["Avail_min"] = kap_active["Verfuegbare_Minuten"].fillna(0) - kap_active["Wartung_Minuten"].fillna(0)
     capacity_left: Dict[str, float] = dict(zip(kap_active["Presse_ID"], kap_active["Avail_min"]))
 
-    # Relevante Kombinationen
+    # Zulässigkeiten/Zeiten
     rel = (
         bedarfe[bedarfe["KW_num"]==params.kw][["Artikel","Bedarf"]]
         .merge(freigaben[["Artikel","Pressenname","Cavity"]], on="Artikel", how="inner")
@@ -282,13 +298,11 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
     if rel.empty:
         raise RuntimeError("Keine relevanten Datensätze (Bedarf + zulässige Pressen + Zeiten).")
 
-    # Demand-Minuten
     cavity_per_art = rel.groupby("Artikel")["Cavity"].max().to_dict()
     dem = demand_minutes(bedarfe[bedarfe["KW_num"]==params.kw][["Artikel","Bedarf"]], zyklen_u, cavity_per_art)
 
     r_map = dem.set_index("Artikel")["r"].to_dict()
     s_map = dem.set_index("Artikel")["Schließzeit"].to_dict()
-    min_per_piece = dem.set_index("Artikel")["Min_pro_Stk"].to_dict()
     remain_min: Dict[str, float] = dem.set_index("Artikel")["Bedarfsminuten"].to_dict()
 
     # Pull-ahead Pools (KW+1..+N)
@@ -297,7 +311,11 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
         future_kws = [params.kw + i for i in range(1, params.pull_weeks+1)]
         bed_future = bedarfe[bedarfe["KW_num"].isin(future_kws)][["Artikel","KW_num","Bedarf"]].copy()
         if not bed_future.empty:
-            cav_map = (freigaben.merge(pressen_active, on="Pressenname", how="inner").groupby("Artikel")["Cavity"].max().to_dict())
+            cav_map = (
+                freigaben.merge(pressen_active, on="Pressenname", how="inner")
+                         .groupby("Artikel")["Cavity"].max()
+                         .to_dict()
+            )
             gz_map = zyklen_u.set_index("Artikel")["Gesamtzyklus"].to_dict()
             bed_future["Cavity"] = bed_future["Artikel"].map(cav_map)
             bed_future["GZ"]     = bed_future["Artikel"].map(gz_map)
@@ -306,22 +324,19 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
             bed_future["Bedarfsminuten"] = bed_future["Bedarf"]*bed_future["Min_pro_Stk"]
             for kwv, g in bed_future.groupby("KW_num"):
                 future_pool_by_kw[int(kwv)] = dict(zip(g["Artikel"], g["Bedarfsminuten"]))
-
     def pull_from_future(artikel: str, need_min: float) -> List[Tuple[int, float]]:
-        pulled=[]
-        if need_min<=0: return pulled
+        out=[]
         for kwv in sorted(future_pool_by_kw.keys()):
+            if need_min<=1e-6: break
             avail = future_pool_by_kw[kwv].get(artikel, 0.0)
             if avail<=1e-6: continue
             take = min(need_min, avail)
-            if take>0:
-                future_pool_by_kw[kwv][artikel] = avail - take
-                pulled.append((kwv, take))
-                need_min -= take
-                if need_min<=1e-6: break
-        return pulled
+            future_pool_by_kw[kwv][artikel] = avail - take
+            out.append((kwv, take))
+            need_min -= take
+        return out
 
-    # allowed/presses/limits
+    # Standstruktur
     allowed_by_stand: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
     for _, row in rel.iterrows():
         allowed_by_stand[row["StandID"]][row["Artikel"]].add(str(row["PressID"]))
@@ -332,8 +347,9 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
     tools_limit = {a: int(tools_map.get(a, 9999)) for a in articles}
     presses_for_article: Dict[str, Set[str]] = {a: set() for a in articles}
 
-    # Zellen bilden
+    # Vorplanung: Zellen/Einzel auf Minuten verteilen (ohne Schichten)
     cell_frames=[]; plan_rows_all: List[Dict] = []
+
     def run_cells(k:int):
         nonlocal cell_frames, plan_rows_all
         c,p = build_cells(
@@ -347,19 +363,20 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
     if "3er" in params.cell_strategy: run_cells(3)
     if ("2er" in params.cell_strategy) or (params.cell_strategy=="nur 2er → Einzel"): run_cells(2)
 
-    # Restbedarf → Einzel
-    def add_plan(stand_id: str, press: str, artikel: str, minutes: float, cell_id: str):
+    # Rest als Singles
+    def add_single(stand_id: str, press: str, artikel: str, minutes: float):
         if press not in presses_for_article[artikel] and len(presses_for_article[artikel]) >= tools_limit[artikel]:
             return 0.0
         take = min(minutes, capacity_left.get(press,0.0), remain_min.get(artikel,0.0))
         if take<=0: return 0.0
         plan_rows_all.append({"StandID":stand_id,"Presse":press,"Artikel":artikel,
-                              "Dauer_min":float(take),"CellID":cell_id,"QuelleKW":None})
+                              "Dauer_min":float(take),"CellID":f"Single-{artikel}","QuelleKW":None})
         capacity_left[press] = capacity_left.get(press,0.0) - take
         remain_min[artikel] = remain_min.get(artikel,0.0) - take
         presses_for_article[artikel].add(press)
         return take
 
+    # naive Singles-Auffüllung
     for a in articles:
         need = remain_min.get(a,0.0)
         if need<=1e-6: continue
@@ -368,240 +385,299 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
         poss = poss.sort_values("Cap_left", ascending=False)
         for _, r in poss.iterrows():
             if need<=1e-6: break
-            take = add_plan(str(r["StandID"]), str(r["PressID"]), a, need, cell_id=f"Single-{a}")
+            take = add_single(str(r["StandID"]), str(r["PressID"]), a, need)
             need -= take
 
     cells_df = pd.concat(cell_frames, ignore_index=True) if cell_frames else pd.DataFrame(columns=["Hinweis"], data=[["Keine Zellen gebildet"]])
     plan_df = pd.DataFrame(plan_rows_all, columns=["StandID","Presse","Artikel","Dauer_min","CellID","QuelleKW"])
-
-    # ---- Vorziehen, um Zellen zu verlängern (auf Zellen-Pressen) ----
-    if params.allow_pull_ahead and future_pool_by_kw and not cells_df.empty:
-        for _, row in cells_df.iterrows():
-            # alle Paare (Art,Presse) der Zelle
-            art_cols = sorted([c for c in row.index if str(c).startswith("Art")])
-            prs_cols = sorted([c for c in row.index if str(c).startswith("Presse")])
-            pairs = [(row[ac], str(row[pc])) for ac,pc in zip(art_cols, prs_cols) if pd.notna(row[ac]) and pd.notna(row[pc])]
-            for art, press in pairs:
-                cap = capacity_left.get(press, 0.0)
-                if cap <= 1e-6: continue
-                pulled = pull_from_future(str(art), cap)
-                for kw_src, mins in pulled:
-                    plan_df.loc[len(plan_df)] = [row["StandID"], press, str(art), float(mins), row["CellID"], int(kw_src)]
-                    capacity_left[press] = capacity_left.get(press,0.0) - mins
 
     # Namen
     name_map = pressen_active.set_index("PressID")["Pressenname"].to_dict()
     stand_name_map = staende.set_index("StandID")["StandName"].to_dict()
     plan_df["Pressenname"] = plan_df["Presse"].astype(str).map(name_map)
     plan_df["StandName"]   = plan_df["StandID"].map(stand_name_map)
-    plan_df = plan_df[["StandID","StandName","Presse","Pressenname","Artikel","Dauer_min","CellID","QuelleKW"]] \
-                 .sort_values(["StandID","Presse","Artikel"]).reset_index(drop=True)
 
-    # ---------------------- >>> SHIFT SCHEDULER ----------------------
-    def make_shifts(year:int, kw:int, start_hour:int) -> List[Tuple[datetime, datetime, str]]:
-        """Erzeuge 7*3 Schichten ab Montag KW, je 8h."""
-        anchor = datetime.combine(date.fromisocalendar(year, kw, 1), time(hour=start_hour))
-        names = ["Früh","Spät","Nacht"]
-        shifts=[]
-        for d in range(7):
-            for s in range(3):
-                stt = anchor + timedelta(days=d, hours=8*s)
-                end = stt + timedelta(hours=8)
-                shifts.append((stt, end, f"{names[s]} D{d+1}"))
-        return shifts
-
-    # Restminuten je (Presse, Artikel, CellID)
-    rem = (plan_df.groupby(["Presse","Artikel","CellID"])["Dauer_min"].sum().to_dict())
-
-    # Presse→Stand/Name
-    press2stand = plan_df.drop_duplicates("Presse").set_index("Presse")[["StandID","StandName","Pressenname"]].to_dict(orient="index")
-
-    # Zellen-Mapping: CellID -> Liste (Presse, Artikel, StandID)
-    cell_map: Dict[str, List[Tuple[str,str,str]]] = defaultdict(list)
-    for _, r in plan_df.iterrows():
-        cell_map[str(r["CellID"])].append((str(r["Presse"]), str(r["Artikel"]), str(r["StandID"])))
-
-    # Vorbereitung: Kapazität je Presse pro Woche (für Kontrolle)
-    # (Wir setzen in Schichtplanung nur die zeitliche Reihenfolge; Minuten sind schon rem)
-    last_article: Dict[str, Optional[str]] = {}   # letzte Artikel je Presse (für Rüstungsprüfung)
-    sch_rows=[]
-
+    # ---- SCHICHTPLANER (synchron) ----
     shifts = make_shifts(params.gantt_year, params.kw, params.shift_start_hour)
+    # Minutenpools je (CellID, Presse, Artikel)
+    pool = plan_df.groupby(["CellID","Presse","Artikel"])["Dauer_min"].sum().to_dict()
+    # Singles ermitteln
+    single_keys = [k for k in pool.keys() if str(k[0]).startswith("Single-")]
 
-    # Helper: Rüstung einfügen (falls Artikelwechsel)
-    def ensure_setup(press:str, cur_t:datetime, new_art:str) -> datetime:
-        la = last_article.get(press)
-        if la is not None and la != new_art and params.setup_minutes>0:
-            sch_rows.append({
-                "StandID": press2stand[press]["StandID"],
-                "StandName": press2stand[press]["StandName"],
-                "Presse": press, "Pressenname": press2stand[press]["Pressenname"],
-                "Artikel": "RÜSTEN", "CellID": "SETUP",
-                "Start": cur_t, "Ende": cur_t + timedelta(minutes=params.setup_minutes),
-                "Dauer_min": float(params.setup_minutes)
-            })
-            cur_t = cur_t + timedelta(minutes=params.setup_minutes)
-        return cur_t
+    # Zellen-Mapping je Stand
+    cells_by_stand: Dict[str, List[Dict]] = defaultdict(list)
+    if not cells_df.empty and "CellID" in cells_df.columns:
+        for _, row in cells_df.iterrows():
+            # Art/Presse-Paare extrahieren
+            arts = [c for c in row.index if str(c).startswith("Art")]
+            prss = [c for c in row.index if str(c).startswith("Presse")]
+            pairs=[]
+            for i in range(min(len(arts), len(prss))):
+                a = row.get(arts[i]); p = row.get(prss[i])
+                if pd.notna(a) and pd.notna(p):
+                    pairs.append((str(p), str(a)))
+            if pairs:
+                cells_by_stand[str(row["StandID"])].append({"cell_id": row["CellID"], "pairs": pairs})
 
-    # ad-hoc Kombinatorik (relaxed) für eine Stand-Teilmenge an Pressen
-    def pick_ad_hoc_cell(stand_id:str, free_presses:List[str], shift_left_min:Dict[str,float]) -> Optional[List[Tuple[str,str]]]:
-        # Kandidaten-Artikel: mit Rest (über alle Pressen/Cells)
-        art_rest = defaultdict(float)
-        for (p,a,c),v in rem.items():
-            if v>1e-6:
-                art_rest[a]+=v
-        arts = [a for a,v in art_rest.items() if v>1e-6]
-        if not arts or len(free_presses)==0: return None
+    # Hilfen
+    kap_total = kap_active.set_index("Presse_ID")["Avail_min"].to_dict()
+    cap_left_for_schedule = kap_total.copy()
+    prev_art_on_press: Dict[str, Optional[str]] = defaultdict(lambda: None)
 
-        # Suche 3er, dann 2er Kombinationen
-        def feasible(comb, k):
-            svals = [s_map.get(a) for a in comb]
-            if any(pd.isna(s) for s in svals): return False
-            if k>=2:
-                if sum(r_map.get(a,0) for a in comb) > params.ad_hoc_relaxed_sum_r: return False
-                if spread_from_s(svals) > params.ad_hoc_relaxed_spread: return False
-            # Zuordnung: je Artikel irgendeine freie Presse im Stand, die Artikel führen kann?
-            mapping=[]
-            used=set()
-            for a in comb:
-                poss=[p for p in free_presses if (p not in used) and (a in [art for (_,art,_) in cell_map.get("Single-"+a, [])] or True)]
-                # wir prüfen Zulässigkeit über allowed_by_stand:
-                poss=[p for p in poss if a in allowed_by_stand[stand_id]]
-                if not poss: return False
-                mapping.append((poss[0], a)); used.add(poss[0])
-            return mapping
+    sched_rows=[]
+    pulled_rows=[]
 
-        for k in (3,2):
+    def all_pairs_have_minutes(pairs):
+        return all(pool.get((cell_id, p, a), 0.0) > 1e-6 for (p,a) in pairs)
+
+    def feasible_runtime(pairs, shift_minutes):
+        # gleicher Laufzeitblock für alle Pressen in der Zelle
+        mins = min(
+            [pool.get((cell_id, p, a), 0.0) for (p,a) in pairs] +
+            [cap_left_for_schedule.get(p,0.0) for (p,_) in pairs] +
+            [shift_minutes]
+        )
+        return float(max(0.0, mins))
+
+    # Fallback-Kombinatorik (ad-hoc) mit Relax
+    def build_fallback_cell(stand_id: str, available_presses: List[str], shift_minutes: float):
+        # k bevorzugt 3, sonst 2, sonst 1
+        for k in [3,2,1]:
+            if len(available_presses) < k: continue
+            # Kandidaten-Artikel: solche, die auf mind. einer freien Presse im Stand zugelassen sind
+            arts = set()
+            for a,_ in r_map.items():
+                if any(p in allowed_by_stand[stand_id].get(a, set()) for p in available_presses):
+                    arts.add(a)
+            arts = sorted(list(arts))
+            if len(arts) < k: continue
+            best=None
             for comb in itertools.combinations(arts, k):
-                m = feasible(comb, k)
-                if m: return m  # Liste (Presse, Artikel)
-        # als Fallback: Einzel
-        # nimm größte Restmenge auf der ersten freien Presse, wenn zulässig
-        a_best = None; v_best=0.0
-        for a,v in art_rest.items():
-            if v>v_best and a in allowed_by_stand[stand_id]:
-                a_best=a; v_best=v
-        if a_best is None: return None
-        return [(free_presses[0], a_best)]
+                # Σr/Spread mit relax prüfen
+                sumr = sum(r_map.get(a,0.0) for a in comb)
+                svals = [s_map.get(a,0.0) for a in comb]
+                sp = spread_from_s(svals)
+                if sumr <= params.sum_r_limit*params.relax_factor_sumr and sp <= min(0.5, params.max_spread+params.relax_spread_add):
+                    # Pressen zuordnen (greedy nach Kapazität)
+                    used=set(); mapping=[]
+                    for a in comb:
+                        poss=[p for p in allowed_by_stand[stand_id].get(a, set()) if p in available_presses and p not in used and cap_left_for_schedule.get(p,0.0)>1e-6]
+                        if not poss: mapping=[]; break
+                        poss.sort(key=lambda p: -cap_left_for_schedule.get(p,0.0))
+                        mapping.append((poss[0], a)); used.add(poss[0])
+                    if len(mapping)==k:
+                        best = mapping; break
+            if best:
+                # Minutenquelle = future_pool (falls erlaubt), sonst 0
+                need = min(shift_minutes, *[cap_left_for_schedule.get(p,0.0) for p,_ in best])
+                # Pull pro Artikel
+                pulled_total=[]
+                for p,a in best:
+                    pulled = pull_from_future(a, need)
+                    if not pulled: pulled_total=[]; break
+                    pulled_total.append((p,a,pulled))
+                if pulled_total:
+                    # schreibe in pool (CellID = Fallback-StandID-<idx>)
+                    fallback_id = f"Fallback-{stand_id}"
+                    take = min([sum(x[2][0][1] for x in pulled_total)] + [need])  # grob
+                    for p,a,pul in pulled_total:
+                        got = sum(q for _,q in pul)
+                        pool[(fallback_id, p, a)] = pool.get((fallback_id,p,a), 0.0) + min(got, take)
+                        for kwsrc, q in pul:
+                            pulled_rows.append((a, kwsrc, params.kw, q, stand_id, p, fallback_id))
+                    return {"cell_id": fallback_id, "pairs": best}
+        return None
 
-    # eigentlicher Schicht-Loop
-    for shift_idx, (s_start, s_end, s_name) in enumerate(shifts, start=1):
-        # aktueller Cursor je Presse: Schichtstart
-        cur_t = {p: s_start for p in press2stand.keys()}
+    # Haupt-Schleife: pro Stand, pro Schicht
+    for stand_id, press_list in presses_by_stand.items():
+        press_list = [str(p) for p in press_list]
+        cell_list = cells_by_stand.get(str(stand_id), [])
+        for (shift_idx, sh_start, sh_end, day, sh_name) in shifts:
+            t = sh_start
+            while t < sh_end:
+                # Freie Pressen (mit Restkapazität) zu Beginn dieses Blocks
+                free_presses = [p for p in press_list if cap_left_for_schedule.get(p,0.0) > 1e-6]
+                if not free_presses:
+                    break
+                remaining_in_shift = (sh_end - t).total_seconds()/60.0
+                if remaining_in_shift <= 1e-6:
+                    break
 
-        # 1) vorhandene Zellen einmal „anlaufen“ lassen (synchron)
-        # pro CellID → nur wenn alle zugehörigen Pressen Rest haben
-        for cell_id, triples in cell_map.items():
-            # Pressen & Artikel je Zelle
-            presses = [p for p,_,_ in triples]
-            arts    = {p:a for p,a,_ in triples}
-            # hat jede Presse noch Rest?
-            if not all(rem.get((p, arts[p], cell_id), 0.0)>1e-6 for p in presses):
-                continue
-            # Setups einplanen (individuell) und gemeinsamen Start ausrichten
-            starts = {}
-            for p in presses:
-                t = cur_t[p]
-                t = ensure_setup(p, t, arts[p])
-                starts[p]=t
-            start_block = max(starts.values())
-            if start_block >= s_end:  # keine Zeit in dieser Schicht
-                continue
-            # mögliche Dauer begrenzt durch Rest & Schichtende & individuelle Verschiebungen
-            dur_candidates=[]
-            for p in presses:
-                left_rem = rem.get((p, arts[p], cell_id), 0.0)
-                left_shift = (s_end - start_block).total_seconds()/60.0
-                dur_candidates.append(left_rem)
-                dur_candidates.append(left_shift)
-            dur = max(0.0, min(dur_candidates))
-            if dur <= 1e-3:
-                continue
-            # synchronen Block für alle Pressen schreiben
-            for p in presses:
-                a = arts[p]
-                sch_rows.append({
-                    "StandID": press2stand[p]["StandID"], "StandName": press2stand[p]["StandName"],
-                    "Presse": p, "Pressenname": press2stand[p]["Pressenname"],
-                    "Artikel": (f"{a} [vorgezogen aus KW {int(k)}]" if isinstance(next((k for (pp,aa,ci),v in rem.items() if pp==p and aa==a and ci==cell_id and v>0 and False), None), int) else a),
-                    "CellID": cell_id,
-                    "Start": start_block,
-                    "Ende": start_block + timedelta(minutes=dur),
-                    "Dauer_min": float(dur)
-                })
-                # Update
-                rem[(p,a,cell_id)] = rem.get((p,a,cell_id),0.0) - dur
-                cur_t[p] = start_block + timedelta(minutes=dur)
-                last_article[p] = a
+                # 1) Ready 3er/2er-Zellen ohne Rüstbedarf (alle Pressen gleiches prev_art)
+                cand=[]
+                for cell in cell_list:
+                    cell_id = cell["cell_id"]; pairs = [(p,a) for (p,a) in cell["pairs"] if p in free_presses]
+                    # brauchbar nur, wenn alle Paarungen abgedeckt sind (volle Zelle) und Minuten vorhanden
+                    if len(pairs) != len(cell["pairs"]): continue
+                    if not all_pairs_have_minutes(pairs): continue
+                    # ready? kein Rüstbedarf auf irgendeiner Presse
+                    if any(prev_art_on_press.get(p) not in (None, a) for (p,a) in pairs):
+                        continue
+                    run = feasible_runtime(pairs, remaining_in_shift)
+                    if run > 1e-6:
+                        cand.append((run, cell_id, pairs))
+                if cand:
+                    # längsten Block fahren
+                    cand.sort(key=lambda x: -x[0])
+                    run, cell_id, pairs = cand[0]
+                    # schreiben
+                    for (p,a) in pairs:
+                        sched_rows.append({
+                            "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                            "Presse": p, "Pressenname": name_map.get(p, p),
+                            "Artikel": a, "CellID": cell_id,
+                            "Start": t, "Ende": t + timedelta(minutes=run), "Dauer_min": run
+                        })
+                        pool[(cell_id,p,a)] = pool.get((cell_id,p,a),0.0) - run
+                        cap_left_for_schedule[p] = cap_left_for_schedule.get(p,0.0) - run
+                        prev_art_on_press[p] = a
+                    t = t + timedelta(minutes=run)
+                    continue
 
-        # 2) Restzeit der Schicht mit ad-hoc Zellen füllen (optional)
-        if ad_hoc_enable:
-            # solange es Pressen mit freier Zeit bis Schichtende gibt
-            changed = True
-            while changed:
-                changed = False
-                # je Stand separat (Presse-Cursor gleich s_start oder > s_start erlaubt; wir starten synchron ab max(cur_t) der beteiligten Pressen)
-                stands = sorted(set(v["StandID"] for v in press2stand.values()))
-                for stand_id in stands:
-                    stand_presses = [p for p,v in press2stand.items() if v["StandID"]==stand_id]
-                    free = [p for p in stand_presses if cur_t[p] < s_end - timedelta(minutes=1)]
-                    if not free:
+                # 2) Zellen mit Rüstbedarf (synchron RÜSTEN -> dann Lauf)
+                cand=[]
+                for cell in cell_list:
+                    cell_id = cell["cell_id"]; pairs = [(p,a) for (p,a) in cell["pairs"] if p in free_presses]
+                    if len(pairs) != len(cell["pairs"]): continue
+                    if not all_pairs_have_minutes(pairs): continue
+                    # wenn Rüstzeit in dieser Schicht nicht mehr reinpasst, überspringen
+                    if remaining_in_shift <= params.setup_minutes+1:
                         continue
-                    # wähle bis zu 3 Pressen
-                    free = free[:3]
-                    # ad-hoc Kombi finden
-                    mapping = pick_ad_hoc_cell(stand_id, free, {p: (s_end - cur_t[p]).total_seconds()/60.0 for p in free})
-                    if not mapping:
-                        continue
-                    # gemeinsamer Start = spätester Cursor nach evtl. Rüstung
-                    starts={}
-                    arts_map={p:a for p,a in mapping}
-                    for p,a in mapping:
-                        t = ensure_setup(p, cur_t[p], a)
-                        starts[p]=t
-                    start_block = max(starts.values())
-                    if start_block >= s_end:
-                        continue
-                    # mögliche Dauer = min(Rest pro (p,a,*), Schichtrest)
-                    dur_cands=[]
-                    # Wir nehmen Rest je (p,a,*) über beliebige CellIDs: summiere rem für dieses (p,a)
-                    def rest_pa(p,a):
-                        return sum(v for (pp,aa,_),v in rem.items() if pp==p and aa==a)
-                    for p,a in mapping:
-                        dur_cands.append(rest_pa(p,a))
-                    dur_cands.append((s_end - start_block).total_seconds()/60.0)
-                    dur = max(0.0, min(dur_cands))
-                    if dur <= 1e-3: 
-                        continue
-                    # von den vorhandenen rem-Einträgen für (p,a,*) in Reihenfolge abziehen
-                    for p,a in mapping:
-                        left = dur
-                        # falls kein passender Rem-Eintrag existiert (z. B. alles verplant), überspringen
-                        for key in [k for k in list(rem.keys()) if k[0]==p and k[1]==a and rem[k]>1e-6]:
-                            take = min(rem[key], left)
-                            if take<=0: continue
-                            # schreibe Block einmal – wir kennzeichnen als ad-hoc Cell
-                            sch_rows.append({
-                                "StandID": press2stand[p]["StandID"], "StandName": press2stand[p]["StandName"],
-                                "Presse": p, "Pressenname": press2stand[p]["Pressenname"],
-                                "Artikel": a, "CellID": f"AdHoc-{stand_id}-{shift_idx}",
-                                "Start": start_block, "Ende": start_block + timedelta(minutes=dur),
-                                "Dauer_min": float(dur)
+                    run = feasible_runtime(pairs, remaining_in_shift - params.setup_minutes)
+                    if run > 1e-6:
+                        cand.append((run, cell_id, pairs))
+                if cand:
+                    cand.sort(key=lambda x: -x[0])
+                    run, cell_id, pairs = cand[0]
+                    # RÜSTEN synchron
+                    for (p, _) in pairs:
+                        sched_rows.append({
+                            "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                            "Presse": p, "Pressenname": name_map.get(p, p),
+                            "Artikel": "RÜSTEN", "CellID": "SETUP",
+                            "Start": t, "Ende": t + timedelta(minutes=params.setup_minutes), "Dauer_min": float(params.setup_minutes)
+                        })
+                        cap_left_for_schedule[p] = cap_left_for_schedule.get(p,0.0) - params.setup_minutes
+                        # prev_art bleibt bestehen; Rüstwechsel wird beim Start gesetzt
+                    t = t + timedelta(minutes=params.setup_minutes)
+                    # Produktion synchron
+                    for (p,a) in pairs:
+                        sched_rows.append({
+                            "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                            "Presse": p, "Pressenname": name_map.get(p, p),
+                            "Artikel": a, "CellID": cell_id,
+                            "Start": t, "Ende": t + timedelta(minutes=run), "Dauer_min": run
+                        })
+                        pool[(cell_id,p,a)] = pool.get((cell_id,p,a),0.0) - run
+                        cap_left_for_schedule[p] = cap_left_for_schedule.get(p,0.0) - run
+                        prev_art_on_press[p] = a
+                    t = t + timedelta(minutes=run)
+                    continue
+
+                # 3) 2er-Zellen oder Singles aus dem Pool (geplant) – ohne Setup bevorzugen
+                # 3a) Singles ohne Rüst
+                single_cand=[]
+                for (cell_id,p,a) in single_keys:
+                    if p not in free_presses: continue
+                    if pool.get((cell_id,p,a),0.0) <= 1e-6: continue
+                    if prev_art_on_press.get(p) not in (None, a): continue
+                    run = min(pool.get((cell_id,p,a),0.0), cap_left_for_schedule.get(p,0.0), remaining_in_shift)
+                    if run>1e-6:
+                        single_cand.append((run, cell_id, p, a))
+                if single_cand:
+                    single_cand.sort(key=lambda x: -x[0])
+                    run, cell_id, p, a = single_cand[0]
+                    sched_rows.append({
+                        "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                        "Presse": p, "Pressenname": name_map.get(p, p),
+                        "Artikel": a, "CellID": cell_id,
+                        "Start": t, "Ende": t + timedelta(minutes=run), "Dauer_min": run
+                    })
+                    pool[(cell_id,p,a)] -= run
+                    cap_left_for_schedule[p] -= run
+                    prev_art_on_press[p] = a
+                    t = t + timedelta(minutes=run)
+                    continue
+
+                # 3b) Singles mit Setup (falls noch Zeit)
+                single_cand=[]
+                for (cell_id,p,a) in single_keys:
+                    if p not in free_presses: continue
+                    if pool.get((cell_id,p,a),0.0) <= 1e-6: continue
+                    if remaining_in_shift <= params.setup_minutes+1: continue
+                    run = min(pool.get((cell_id,p,a),0.0), cap_left_for_schedule.get(p,0.0), remaining_in_shift - params.setup_minutes)
+                    if run>1e-6:
+                        single_cand.append((run, cell_id, p, a))
+                if single_cand:
+                    single_cand.sort(key=lambda x: -x[0])
+                    run, cell_id, p, a = single_cand[0]
+                    # Rüst
+                    sched_rows.append({
+                        "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                        "Presse": p, "Pressenname": name_map.get(p, p),
+                        "Artikel": "RÜSTEN", "CellID": "SETUP",
+                        "Start": t, "Ende": t + timedelta(minutes=params.setup_minutes), "Dauer_min": float(params.setup_minutes)
+                    })
+                    cap_left_for_schedule[p] -= params.setup_minutes
+                    t = t + timedelta(minutes=params.setup_minutes)
+                    # Prod
+                    sched_rows.append({
+                        "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                        "Presse": p, "Pressenname": name_map.get(p, p),
+                        "Artikel": a, "CellID": cell_id,
+                        "Start": t, "Ende": t + timedelta(minutes=run), "Dauer_min": run
+                    })
+                    pool[(cell_id,p,a)] -= run
+                    cap_left_for_schedule[p] -= run
+                    prev_art_on_press[p] = a
+                    t = t + timedelta(minutes=run)
+                    continue
+
+                # 4) Ad-hoc Fallback-Zelle (mit relax + Vorziehen), wenn nichts anderes geht
+                fb = build_fallback_cell(str(stand_id), free_presses, remaining_in_shift)
+                if fb:
+                    cell_id = fb["cell_id"]; pairs = fb["pairs"]
+                    # ready?
+                    needs_setup = any(prev_art_on_press.get(p) not in (None, a) for (p,a) in pairs)
+                    if needs_setup and remaining_in_shift <= params.setup_minutes+1:
+                        break  # diese Schicht nichts mehr sinnvoll
+                    max_run = min([pool.get((cell_id,p,a),0.0) for (p,a) in pairs] + [cap_left_for_schedule.get(p,0.0) for (p,_) in pairs])
+                    if needs_setup:
+                        # Rüst synchron
+                        for (p,_) in pairs:
+                            sched_rows.append({
+                                "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                                "Presse": p, "Pressenname": name_map.get(p, p),
+                                "Artikel": "RÜSTEN", "CellID": "SETUP",
+                                "Start": t, "Ende": t + timedelta(minutes=params.setup_minutes), "Dauer_min": float(params.setup_minutes)
                             })
-                            rem[key] = rem[key] - take
-                            left -= take
-                            if left<=1e-6: break
-                        cur_t[p] = start_block + timedelta(minutes=dur)
-                        last_article[p] = a
-                    changed = True  # wir haben etwas eingeplant
+                            cap_left_for_schedule[p] -= params.setup_minutes
+                        t = t + timedelta(minutes=params.setup_minutes)
+                        remaining_in_shift = (sh_end - t).total_seconds()/60.0
+                    run = min(max_run, remaining_in_shift)
+                    if run>1e-6:
+                        for (p,a) in pairs:
+                            sched_rows.append({
+                                "StandID": stand_id, "StandName": stand_name_map.get(stand_id, f"S{stand_id}"),
+                                "Presse": p, "Pressenname": name_map.get(p, p),
+                                "Artikel": f"{a} [ad-hoc]", "CellID": cell_id,
+                                "Start": t, "Ende": t + timedelta(minutes=run), "Dauer_min": run
+                            })
+                            pool[(cell_id,p,a)] = pool.get((cell_id,p,a),0.0) - run
+                            cap_left_for_schedule[p] -= run
+                            prev_art_on_press[p] = a
+                        t = t + timedelta(minutes=run)
+                        continue
 
-    schedule_df = pd.DataFrame(sch_rows).sort_values(["StandID","Presse","Start"]).reset_index(drop=True)
-    # ---------------------- <<< SHIFT SCHEDULER ----------------------
+                # 5) Nichts mehr machbar → Schichtende für diesen Stand
+                break
 
-    # Coverage nach Schedule (RÜSTEN ausgeschlossen)
+    schedule_df = pd.DataFrame(sched_rows).sort_values(["StandID","Presse","Start"])
+    pulled_df = pd.DataFrame(pulled_rows, columns=["Artikel","QuelleKW","ZielKW","Minuten","StandID","Presse","CellID"]) if pulled_rows else pd.DataFrame()
+
+    # Coverage aus Schedule (RÜSTEN / ad-hoc gekennzeichnete Namen säubern)
     prod = schedule_df[schedule_df["Artikel"]!="RÜSTEN"].copy()
-    # evtl. „[vorgezogen …]“ entfernen
-    prod["Artikel_join"] = prod["Artikel"].str.replace(r"\s+\[vorgezogen.*\]","", regex=True)
+    prod["Artikel_join"] = prod["Artikel"].str.replace(r"\s+\[.*\]","", regex=True)
     prod_minutes = prod.groupby("Artikel_join")["Dauer_min"].sum()
     dem2 = dem.copy()
     dem2["Geplante_Minuten"] = dem2["Artikel"].map(prod_minutes).fillna(0.0)
@@ -609,9 +685,10 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
     dem2["Deckungsgrad_%"] = (dem2["Geplante_Minuten"] / dem2["Bedarfsminuten"]).clip(upper=1.0) * 100.0
     dem2["Restminuten"] = (dem2["Bedarfsminuten"] - dem2["Geplante_Minuten"]).clip(lower=0.0)
     dem2["Restmenge_Stk"] = dem2["Restminuten"] / dem2["Min_pro_Stk"]
+
     art_df = dem2[["Artikel","Bedarf","Min_pro_Stk","Bedarfsminuten","Geplante_Minuten","Geplante_Stk","Deckungsgrad_%","Restminuten","Restmenge_Stk"]]
 
-    # KPI
+    # KPIs
     total_demand_min = float(art_df["Bedarfsminuten"].sum())
     total_planned_min = float(art_df["Geplante_Minuten"].sum())
     total_cap_min = float(kap_active["Avail_min"].sum())
@@ -623,9 +700,15 @@ def plan_all(sheets: Dict[str, pd.DataFrame], params: PlanParams, bedarfe_overri
         "Deckungsgrad gesamt": (total_planned_min / total_demand_min * 100.0) if total_demand_min>0 else 0.0,
     }
 
-    # Vorzugs-Report (aus plan_df ermittelbar, hier weggelassen – optional nachrüstbar)
+    # Ergebnis-Plan (aus Schedule aggregiert)
+    plan_df_final = (prod.groupby(["StandID","Presse","Artikel_join"])
+                        ["Dauer_min"].sum().reset_index()
+                        .rename(columns={"Artikel_join":"Artikel"}))
+    plan_df_final["Pressenname"] = plan_df_final["Presse"].map(name_map)
+    plan_df_final["StandName"] = plan_df_final["StandID"].map(stand_name_map)
+    plan_df_final = plan_df_final[["StandID","StandName","Presse","Pressenname","Artikel","Dauer_min"]]
 
-    return cells_df, plan_df, art_df, schedule_df, kpis
+    return cells_df, plan_df_final, art_df, schedule_df, kpis, pulled_df
 
 # -------- Ablauf --------
 if up is None:
@@ -644,14 +727,12 @@ bedarfe_df["KW_num"] = pd.to_numeric(bedarfe_df["KW"], errors="coerce")
 kw_options = sorted(set(bedarfe_df["KW_num"].dropna().astype(int)))
 selected_kw = st.sidebar.selectbox("Kalenderwoche (KW)", kw_options, index=max(0, len(kw_options)-1))
 
-# Bedarfe-Editor
+kw_articles = sorted(set(bedarfe_df[bedarfe_df["KW_num"]==selected_kw]["Artikel"]))
+selected_exclude = st.sidebar.multiselect("Artikel ausschließen", options=kw_articles, default=[a for a in kw_articles if a in exclude_default])
+
 st.subheader(f"Bedarfe editieren – KW {selected_kw}")
 bedarfe_kw = bedarfe_df[bedarfe_df["KW_num"]==selected_kw][["Artikel","Bedarf"]].copy().reset_index(drop=True)
 edited_bedarfe_kw = st.data_editor(bedarfe_kw, num_rows="fixed", use_container_width=True, key="bedarfs_editor")
-
-# Ausschlüsse (nur Artikel der KW)
-kw_articles = sorted(set(bedarfe_df[bedarfe_df["KW_num"]==selected_kw]["Artikel"]))
-selected_exclude = st.sidebar.multiselect("Artikel ausschließen", options=kw_articles, default=[a for a in kw_articles if a in exclude_default])
 
 go = st.button("🔁 Planung erstellen / aktualisieren", type="primary")
 if not go:
@@ -672,14 +753,13 @@ with st.spinner("Plane…"):
         limit_by_tools=bool(limit_by_tools),
         allow_pull_ahead=bool(allow_pull_ahead),
         pull_weeks=int(pull_weeks),
+        relax_factor_sumr=float(relax_factor_sumr),
+        relax_spread_add=float(relax_spread_add),
         gantt_year=int(gantt_year),
         shift_start_hour=int(shift_start_hour),
         show_shift_grid=bool(show_shift_grid),
-        ad_hoc_relaxed_sum_r=float(ad_hoc_relaxed_sum_r),
-        ad_hoc_relaxed_spread=float(ad_hoc_relaxed_spread),
-        ad_hoc_enable=bool(ad_hoc_enable),
     )
-    cells_df, plan_df, art_df, schedule_df, kpis = plan_all(sheets, params, bedarfe_override_kw=edited_bedarfe_kw)
+    cells_df, plan_df, art_df, schedule_df, kpis, pulled_df = plan_all(sheets, params, bedarfe_override_kw=edited_bedarfe_kw)
 
 # -------- Anzeigen --------
 c1,c2,c3,c4 = st.columns(4)
@@ -691,26 +771,23 @@ c4.metric("Deckungsgrad gesamt", f"{kpis['Deckungsgrad gesamt']:.1f}%")
 st.subheader("Gebildete Zellen")
 st.dataframe(cells_df, use_container_width=True)
 
-st.subheader("Plan je Presse / Artikel (Minuten)")
+st.subheader("Plan je Presse / Artikel (Minuten) – aus Schichtplan")
 st.dataframe(plan_df, use_container_width=True)
 
 st.subheader("Deckung je Artikel")
 st.dataframe(art_df.sort_values(["Deckungsgrad_%","Bedarfsminuten"], ascending=[True, False]), use_container_width=True)
 
-st.subheader("Ablaufplan je Presse (Start/Ende) – schichtweise, synchron")
 if not schedule_df.empty:
-    # Y-Achse sortieren: StandID ↑, innerhalb Stand nach Pressenname ↑
     schedule_df = schedule_df.copy()
     schedule_df["YLabel"] = schedule_df.apply(lambda r: f"S{r['StandID']} | {r['StandName']} | {r['Pressenname']}", axis=1)
     yorder = schedule_df.drop_duplicates(subset=["Presse","YLabel"]).sort_values(["StandID","Pressenname"])["YLabel"].tolist()
-
-    # Farb-Logik: RÜSTEN = grau; sonst eine Farbe pro CellID (Zellen & Ad-hoc klar)
+    # Farb-Logik: RÜSTEN grau, jede CellID sonst eigene Farbe
     schedule_df["ColorKey"] = schedule_df["CellID"].where(schedule_df["Artikel"]!="RÜSTEN", other="SETUP")
 
+    st.subheader("Schicht-Ablauf je Presse (synchron)")
     st.dataframe(schedule_df, use_container_width=True)
 
-    # Gantt
-    color_map = {"SETUP": "rgb(130,130,130)"}  # feste Farbe für RÜSTEN
+    color_map = {"SETUP": "rgb(130,130,130)"}  # RÜSTEN immer grau
     fig = px.timeline(
         schedule_df,
         x_start="Start", x_end="Ende",
@@ -723,7 +800,6 @@ if not schedule_df.empty:
     fig.update_yaxes(autorange="reversed", categoryorder="array", categoryarray=yorder)
 
     if params.show_shift_grid:
-        # Schichtgitter 7 Tage * 3 Schichten
         anchor = datetime.combine(date.fromisocalendar(params.gantt_year, params.kw, 1), time(hour=params.shift_start_hour))
         shapes=[]; labels=[]; names=["Früh","Spät","Nacht"]
         for d in range(7):
@@ -740,6 +816,11 @@ if not schedule_df.empty:
 
     st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
+if pulled_df is not None and not pulled_df.empty:
+    st.subheader("Vorgezogen (aus zukünftigen KWs)")
+    grp = pulled_df.groupby(["Artikel","QuelleKW"]).agg(Minuten=("Minuten","sum")).reset_index()
+    st.dataframe(grp, use_container_width=True)
+
 # Downloads
 st.subheader("Downloads")
 def to_xlsx_bytes() -> bytes:
@@ -749,6 +830,8 @@ def to_xlsx_bytes() -> bytes:
         plan_df.to_excel(writer, sheet_name="Plan_je_Presse", index=False)
         art_df.to_excel(writer, sheet_name="Coverage_je_Artikel", index=False)
         (schedule_df if not schedule_df.empty else pd.DataFrame({"Hinweis":["Kein Schedule"]})).to_excel(writer, sheet_name="Schedule", index=False)
+        if pulled_df is not None and not pulled_df.empty:
+            pulled_df.to_excel(writer, sheet_name="Vorzuege", index=False)
     return output.getvalue()
 
 st.download_button("📥 Excel-Export", data=to_xlsx_bytes(),
