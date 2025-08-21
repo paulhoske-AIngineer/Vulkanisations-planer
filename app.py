@@ -252,13 +252,13 @@ def build_schedule_with_synchronized_cells(
        Vorziehen aus KW+1/+2 zur Verlängerung guter Zellen. Rüstungen passend einfügen.
     """
     cap_total = kap_active.set_index("Presse_ID")["Avail_min"].to_dict()
-    press_time: Dict[str, datetime] = {}       # aktueller Endzeitpunkt je Presse
-    press_sched_min: Dict[str, float] = {}     # geplante Minuten je Presse
-    prev_art: Dict[str, Optional[str]] = {}    # letzter Artikel je Presse
+    press_time: Dict[str, datetime] = {}
+    press_sched_min: Dict[str, float] = {}
+    prev_art: Dict[str, Optional[str]] = {}
     sch_rows = []
-    used_in_cell: Dict[Tuple[str, str, str], float] = {}  # (Presse, Artikel, CellID) -> Minuten
-    pulled_log_local: List[Tuple[str, int, int, float, str, str, str]] = []  # (Artikel, QuelleKW, ZielKW, Min, StandID, Presse, CellID)
-    pulled_pairs: Set[Tuple[str, str, str]] = set()  # (Presse, Artikel, CellID) die Pull hatten
+    used_in_cell: Dict[Tuple[str, str, str], float] = {}
+    pulled_log_local: List[Tuple[str, int, int, float, str, str, str]] = []
+    pulled_pairs: Set[Tuple[str, str, str]] = set()
 
     def get_t(press: str) -> datetime:
         return press_time.get(press, start_dt)
@@ -288,7 +288,7 @@ def build_schedule_with_synchronized_cells(
         add_minutes(press, float(real_setup_min))
         return max(t_target, setup_end)
 
-    # --- Zellenliste aufbauen (Paare, aktuelle Minuten, Pull-Potenzial, Score) ---
+    # -------- Zellenliste (inkl. Paare mit 0-Minuten) robust aufbauen --------
     cell_jobs = []
     if cells_df is not None and not cells_df.empty:
         for _, row in cells_df.iterrows():
@@ -303,77 +303,78 @@ def build_schedule_with_synchronized_cells(
                     pairs.append((str(a), str(p)))
             if not pairs:
                 continue
+
             sub = plan_df[(plan_df["CellID"] == cell_id)]
             cur_min = {}
             for a, p in pairs:
                 cur = float(sub[(sub["Presse"].astype(str) == p) & (sub["Artikel"] == a)]["Dauer_min"].sum())
-                if cur > 1e-6:
-                    cur_min[(a, p)] = cur
-            if not cur_min:
-                continue
-            base_common = min(cur_min.values())
+                cur_min[(a, p)] = cur  # <-- 0 ist erlaubt!
+
+            # Potenzial (Kapazität + Zukunft) für jedes Paar berechnen
             pot = {}
-            for (a, p) in cur_min.keys():
+            for (a, p) in pairs:
                 pot_cap = max(0.0, capacity_left.get(p, 0.0))
                 pot_future = 0.0
                 if future_pool_by_kw:
                     for kwv in sorted(future_pool_by_kw.keys()):
                         pot_future += future_pool_by_kw[kwv].get(a, 0.0)
                 pot[(a, p)] = max(0.0, min(pot_cap, pot_future))
-            target = min(cur_min[(a, p)] + pot[(a, p)] for (a, p) in cur_min.keys())
-            score = target
-            cell_jobs.append((stand_id, cell_id, pairs, cur_min, pot, score))
-    cell_jobs.sort(key=lambda x: (x[0], -x[5]))  # nach Stand, dann lange Zellen zuerst
 
-    # --- Zellen blockweise synchron planen ---
+            # Score: was wir theoretisch gemeinsam am Stück fahren könnten
+            target = min(cur_min.get((a, p), 0.0) + pot.get((a, p), 0.0) for (a, p) in pairs)
+            cell_jobs.append((stand_id, cell_id, pairs, cur_min, pot, target))
+
+    # Nach Stand sortieren, dann lange Zellen zuerst
+    cell_jobs.sort(key=lambda x: (x[0], -x[5]))
+
+    # -------- Zellen synchron blocken --------
     for stand_id, cell_id, pairs, cur_min, pot, _score in cell_jobs:
-        # Metadaten
+        # Namen ermitteln (Fallbacks, falls plan_df kein Matching hat)
         meta = {}
         for a, p in pairs:
             row_any = plan_df[(plan_df["Presse"].astype(str) == p)].head(1)
-            pressname = row_any["Pressenname"].iloc[0] if not row_any.empty else p
+            pressname = row_any["Pressenname"].iloc[0] if not row_any.empty else str(p)
             standname = row_any["StandName"].iloc[0] if not row_any.empty else ""
             meta[(a, p)] = (pressname, standname)
 
-        # Gemeinsamer Start: max(Verfügbarkeit + ggf. Rüstzeit)
+        # Gemeinsamer Start: max(Verfügbarkeit + evtl. Rüstzeit)
         t_candidates = []
         for a, p in pairs:
             t_cur = get_t(p)
             needs_setup = (prev_art.get(p) is not None and prev_art[p] != a and params.setup_minutes > 0)
             t_candidates.append(t_cur + (timedelta(minutes=params.setup_minutes) if needs_setup else timedelta(0)))
         t_cell = max(t_candidates) if t_candidates else start_dt
-        # Rüstungen so einfügen, dass Start wirklich synchron wird
         for a, p in pairs:
             pressname, standname = meta[(a, p)]
             t_cell = ensure_setup_before(p, pressname, stand_id, standname, t_cell, a)
 
-        # Kapazität je Presse begrenzt Blocklänge
+        # Kapazitätslimit über alle beteiligten Pressen
         cap_limits = []
         for a, p in pairs:
             cap_left = max(0.0, cap_total.get(p, 0.0) - press_sched_min.get(p, 0.0))
             cap_limits.append(cap_left)
         cap_limit_all = min(cap_limits) if cap_limits else float("inf")
 
-        # Ziel-Laufzeit je Paar: cur + (feasible pull), dann Minimum über alle → gemeinsame Länge
+        # Ziel-Länge = min(cur + feasible_pull) über alle Paare (robust mit get)
         feasible_extra = {}
-        for (a, p) in cur_min.keys():
-            extra_cap = max(0.0, min(pot[(a, p)], capacity_left.get(p, 0.0)))
+        for (a, p) in pairs:
+            extra_cap = max(0.0, min(pot.get((a, p), 0.0), capacity_left.get(p, 0.0)))
             feasible_extra[(a, p)] = extra_cap
-        target_len = min(cur_min[(a, p)] + feasible_extra[(a, p)] for (a, p) in cur_min.keys())
+        target_len = min(cur_min.get((a, p), 0.0) + feasible_extra[(a, p)] for (a, p) in pairs)
         target_len = max(0.0, min(target_len, cap_limit_all))
         if target_len <= 1e-6:
-            continue
+            continue  # nichts zu planen
 
-        # Pull aus Zukunft, um Paare auf target_len zu heben
+        # Zukunftsbedarf tatsächlich ziehen (nur soweit nötig)
         if future_pool_by_kw:
-            for (a, p) in list(cur_min.keys()):
-                need = max(0.0, target_len - cur_min[(a, p)])
+            for (a, p) in pairs:
+                need = max(0.0, target_len - cur_min.get((a, p), 0.0))
                 if need <= 1e-6:
                     continue
                 need = min(need, capacity_left.get(p, 0.0))
                 if need <= 1e-6:
                     continue
-                for kwv in sorted(future_pool_by_kw.keys()):  # KW+1 → KW+2 …
+                for kwv in sorted(future_pool_by_kw.keys()):
                     avail = future_pool_by_kw[kwv].get(a, 0.0)
                     if avail <= 1e-6:
                         continue
@@ -382,17 +383,13 @@ def build_schedule_with_synchronized_cells(
                         continue
                     future_pool_by_kw[kwv][a] = avail - take
                     capacity_left[p] = capacity_left.get(p, 0.0) - take
-                    cur_min[(a, p)] += take
                     need -= take
                     pulled_log_local.append((a, kwv, params.kw, take, stand_id, p, cell_id))
                     pulled_pairs.add((p, a, cell_id))
                     if need <= 1e-6:
                         break
 
-        # finale Länge nach Pull, kapazitätsbegrenzt
-        target_len = min([cur_min[(a, p)] for (a, p) in pairs] + [cap_limit_all])
-
-        # Synchroner Block je Presse/Artikel erzeugen
+        # final: synchroner Block je Presse
         for a, p in pairs:
             pressname, standname = meta[(a, p)]
             start = t_cell; end = t_cell + timedelta(minutes=target_len)
@@ -408,7 +405,7 @@ def build_schedule_with_synchronized_cells(
             prev_art[p] = a
             used_in_cell[(p, a, cell_id)] = used_in_cell.get((p, a, cell_id), 0.0) + float(target_len)
 
-    # --- Restliche Minuten (Cell-Reste & Singles) anhängen ---
+    # -------- Rest (Cell-Reste & Singles) anhängen --------
     agg = (plan_df.groupby(["Presse", "Artikel", "CellID", "StandID", "StandName", "Pressenname"], dropna=False)["Dauer_min"]
            .sum().reset_index())
 
@@ -421,7 +418,7 @@ def build_schedule_with_synchronized_cells(
         if rest <= 1e-6:
             continue
 
-        # Rüstzeit bei Artikelwechsel
+        # ggf. Rüstung
         t_cur = get_t(p)
         needs_setup = (prev_art.get(p) is not None and prev_art[p] != a and params.setup_minutes > 0)
         if needs_setup:
